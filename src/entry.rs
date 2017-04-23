@@ -6,8 +6,6 @@ use std::io::{self, Error, ErrorKind, SeekFrom};
 use std::marker;
 use std::path::{Component, Path};
 
-use filetime::{self, FileTime};
-
 use {Header, Archive, PaxExtensions};
 use archive::ArchiveInner;
 use error::TarError;
@@ -408,7 +406,7 @@ impl<'a> EntryFields<'a> {
             fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
                 ::std::os::windows::fs::symlink_file(src, dst)
             }
-            #[cfg(unix)]
+            #[cfg(any(target_os = "redox", unix))]
             fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
                 ::std::os::unix::fs::symlink(src, dst)
             }
@@ -454,11 +452,13 @@ impl<'a> EntryFields<'a> {
         }));
 
         if let Ok(mtime) = self.header.mtime() {
+            /*TODO
             let mtime = FileTime::from_seconds_since_1970(mtime, 0);
             try!(filetime::set_file_times(dst, mtime, mtime).map_err(|e| {
                 TarError::new(&format!("failed to set mtime for `{}`",
                                        dst.display()), e)
             }));
+            */
         }
         if let Ok(mode) = self.header.mode() {
             try!(set_perms(dst, mode, self.preserve_permissions).map_err(|e| {
@@ -484,6 +484,19 @@ impl<'a> EntryFields<'a> {
             };
 
             let perm = fs::Permissions::from_mode(mode as raw::mode_t);
+            fs::set_permissions(dst, perm)
+        }
+        #[cfg(target_os = "redox")]
+        fn set_perms(dst: &Path, mode: u32, preserve: bool) -> io::Result<()> {
+            use std::os::unix::prelude::*;
+
+            let mode = if preserve {
+                mode
+            } else {
+                mode & 0o777
+            };
+
+            let perm = fs::Permissions::from_mode(mode);
             fs::set_permissions(dst, perm)
         }
         #[cfg(windows)]
@@ -531,7 +544,7 @@ impl<'a> EntryFields<'a> {
         }
         // Windows does not completely support posix xattrs
         // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
-        #[cfg(any(windows, not(feature = "xattr")))]
+        #[cfg(any(target_os = "redox", windows, not(feature = "xattr")))]
         fn set_xattrs(_: &mut EntryFields, _: &Path) -> io::Result<()> {
             Ok(())
         }

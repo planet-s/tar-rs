@@ -1,4 +1,4 @@
-#[cfg(unix)] use std::os::unix::prelude::*;
+#[cfg(any(target_os = "redox", unix))] use std::os::unix::prelude::*;
 #[cfg(windows)] use std::os::windows::prelude::*;
 
 use std::borrow::Cow;
@@ -661,6 +661,32 @@ impl Header {
         });
     }
 
+    #[cfg(target_os = "redox")]
+    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+        match mode {
+            HeaderMode::Complete => {
+                self.set_mtime(meta.mtime() as u64);
+                self.set_uid(meta.uid() as u32);
+                self.set_gid(meta.gid() as u32);
+            },
+            HeaderMode::Deterministic => {
+                self.set_mtime(0);
+                self.set_uid(0);
+                self.set_gid(0);
+            },
+            HeaderMode::__Nonexhaustive => panic!(),
+        }
+
+        self.set_mode(meta.mode() as u32);
+
+        // TODO: need to bind more file types, use constants from syscall crate
+        self.set_entry_type(match meta.mode() & 0xF000 {
+            0x4000 => EntryType::file(),
+            0x8000 => EntryType::dir(),
+            _ => EntryType::new(b' '),
+        });
+    }
+
     #[cfg(windows)]
     fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
         match mode {
@@ -1055,7 +1081,7 @@ fn ends_with_slash(p: &Path) -> bool {
     p.as_os_str().encode_wide().last() == Some(b'/' as u16)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "redox", unix))]
 fn ends_with_slash(p: &Path) -> bool {
     p.as_os_str().as_bytes().ends_with(&[b'/'])
 }
@@ -1067,7 +1093,7 @@ pub fn path2bytes(p: &Path) -> io::Result<&[u8]> {
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "redox", unix))]
 pub fn path2bytes(p: &Path) -> io::Result<&[u8]> {
     Ok(p.as_os_str().as_bytes())
 }
@@ -1094,7 +1120,7 @@ pub fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "redox", unix))]
 pub fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
     use std::ffi::{OsStr, OsString};
 

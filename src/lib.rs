@@ -22,7 +22,6 @@
 #![cfg_attr(test, deny(warnings))]
 
 extern crate libc;
-extern crate filetime;
 #[cfg(all(unix, feature = "xattr"))]
 extern crate xattr;
 
