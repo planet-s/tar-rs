@@ -13,6 +13,7 @@ use header::{bytes2path, HeaderMode, path2bytes};
 /// arbitrary writer.
 pub struct Builder<W: Write> {
     mode: HeaderMode,
+    follow: bool,
     finished: bool,
     obj: Option<W>,
 }
@@ -24,6 +25,7 @@ impl<W: Write> Builder<W> {
     pub fn new(obj: W) -> Builder<W> {
         Builder {
             mode: HeaderMode::Complete,
+            follow: true,
             finished: false,
             obj: Some(obj),
         }
@@ -38,6 +40,12 @@ impl<W: Write> Builder<W> {
     /// does _not_ apply to `append(Header)`.
     pub fn mode(&mut self, mode: HeaderMode) {
         self.mode = mode;
+    }
+
+    /// Follow symlinks, archiving the contents of the file they point to rather
+    /// than adding a symlink to the archive. Defaults to true.
+    pub fn follow_symlinks(&mut self, follow: bool) {
+        self.follow = follow;
     }
 
     /// Unwrap this archive, returning the underlying object.
@@ -78,7 +86,7 @@ impl<W: Write> Builder<W> {
     /// use tar::{Builder, Header};
     ///
     /// let mut header = Header::new_gnu();
-    /// header.set_path("foo");
+    /// header.set_path("foo").unwrap();
     /// header.set_size(4);
     /// header.set_cksum();
     ///
@@ -91,6 +99,53 @@ impl<W: Write> Builder<W> {
     pub fn append<R: Read>(&mut self, header: &Header, mut data: R)
                            -> io::Result<()> {
         append(self.inner(), header, &mut data)
+    }
+
+    /// Adds a new entry to this archive with the specified path.
+    ///
+    /// This function will set the specified path in the given header, which may
+    /// require appending a GNU long-name extension entry to the archive first.
+    /// The checksum for the header will be automatically updated via the
+    /// `set_cksum` method after setting the path. No other metadata in the
+    /// header will be modified.
+    ///
+    /// Then it will append the header, followed by contents of the stream
+    /// specified by `data`. To produce a valid archive the `size` field of
+    /// `header` must be the same as the length of the stream that's being
+    /// written.
+    ///
+    /// Note that this will not attempt to seek the archive to a valid position,
+    /// so if the archive is in the middle of a read or some other similar
+    /// operation then this may corrupt the archive.
+    ///
+    /// Also note that after all entries have been written to an archive the
+    /// `finish` function needs to be called to finish writing the archive.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error for any intermittent I/O error which
+    /// occurs when either reading or writing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tar::{Builder, Header};
+    ///
+    /// let mut header = Header::new_gnu();
+    /// header.set_size(4);
+    /// header.set_cksum();
+    ///
+    /// let mut data: &[u8] = &[1, 2, 3, 4];
+    ///
+    /// let mut ar = Builder::new(Vec::new());
+    /// ar.append_data(&mut header, "really/long/path/to/foo", data).unwrap();
+    /// let data = ar.into_inner().unwrap();
+    /// ```
+    pub fn append_data<P: AsRef<Path>, R: Read>(&mut self, header: &mut Header, path: P, data: R)
+                                                -> io::Result<()> {
+        try!(prepare_header(self.inner(), header, path.as_ref()));
+        header.set_cksum();
+        self.append(&header, data)
     }
 
     /// Adds a file on the local filesystem to this archive.
@@ -119,7 +174,8 @@ impl<W: Write> Builder<W> {
     /// ```
     pub fn append_path<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let mode = self.mode.clone();
-        append_path(self.inner(), path.as_ref(), mode)
+        let follow = self.follow;
+        append_path(self.inner(), path.as_ref(), mode, follow)
     }
 
     /// Adds a file to this archive with the given path as the name of the file
@@ -212,7 +268,8 @@ impl<W: Write> Builder<W> {
         where P: AsRef<Path>, Q: AsRef<Path>
     {
         let mode = self.mode.clone();
-        append_dir_all(self.inner(), path.as_ref(), src_path.as_ref(), mode)
+        let follow = self.follow;
+        append_dir_all(self.inner(), path.as_ref(), src_path.as_ref(), mode, follow)
     }
 
     /// Finish writing this archive, emitting the termination sections.
@@ -247,12 +304,19 @@ fn append(mut dst: &mut Write,
     Ok(())
 }
 
-fn append_path(dst: &mut Write, path: &Path, mode: HeaderMode) -> io::Result<()> {
-    let stat = try!(fs::metadata(path));
+fn append_path(dst: &mut Write, path: &Path, mode: HeaderMode, follow: bool) -> io::Result<()> {
+    let stat = if follow {
+        try!(fs::metadata(path))
+    } else {
+        try!(fs::symlink_metadata(path))
+    };
     if stat.is_file() {
-        append_fs(dst, path, &stat, &mut try!(fs::File::open(path)), mode)
+        append_fs(dst, path, &stat, &mut try!(fs::File::open(path)), mode, None)
     } else if stat.is_dir() {
-        append_fs(dst, path, &stat, &mut io::empty(), mode)
+        append_fs(dst, path, &stat, &mut io::empty(), mode, None)
+    } else if stat.file_type().is_symlink() {
+        let link_name = try!(fs::read_link(path));
+        append_fs(dst, path, &stat, &mut io::empty(), mode, Some(&link_name))
     } else {
         Err(other("path has unknown file type"))
     }
@@ -261,21 +325,15 @@ fn append_path(dst: &mut Write, path: &Path, mode: HeaderMode) -> io::Result<()>
 fn append_file(dst: &mut Write, path: &Path, file: &mut fs::File, mode: HeaderMode)
                 -> io::Result<()> {
     let stat = try!(file.metadata());
-    append_fs(dst, path, &stat, file, mode)
+    append_fs(dst, path, &stat, file, mode, None)
 }
 
 fn append_dir(dst: &mut Write, path: &Path, src_path: &Path, mode: HeaderMode) -> io::Result<()> {
     let stat = try!(fs::metadata(src_path));
-    append_fs(dst, path, &stat, &mut io::empty(), mode)
+    append_fs(dst, path, &stat, &mut io::empty(), mode, None)
 }
 
-fn append_fs(dst: &mut Write,
-             path: &Path,
-             meta: &fs::Metadata,
-             read: &mut Read,
-             mode: HeaderMode) -> io::Result<()> {
-    let mut header = Header::new_gnu();
-
+fn prepare_header(dst: &mut Write, header: &mut Header, path: &Path) -> io::Result<()> {
     // Try to encode the path directly in the header, but if it ends up not
     // working (e.g. it's too long) then use the GNU-specific long name
     // extension by emitting an entry which indicates that it's the filename
@@ -301,24 +359,43 @@ fn append_fs(dst: &mut Write,
         let path = try!(bytes2path(Cow::Borrowed(&data[..max])));
         try!(header.set_path(&path));
     }
+    Ok(())
+}
 
+fn append_fs(dst: &mut Write,
+             path: &Path,
+             meta: &fs::Metadata,
+             read: &mut Read,
+             mode: HeaderMode,
+             link_name: Option<&Path>) -> io::Result<()> {
+    let mut header = Header::new_gnu();
+
+    try!(prepare_header(dst, &mut header, path));
     header.set_metadata_in_mode(meta, mode);
+    if let Some(link_name) = link_name {
+        try!(header.set_link_name(link_name));
+    }
     header.set_cksum();
     append(dst, &header, read)
 }
 
-fn append_dir_all(dst: &mut Write, path: &Path, src_path: &Path, mode: HeaderMode) -> io::Result<()> {
-    let mut stack = vec![(src_path.to_path_buf(), true)];
-    while let Some((src, is_dir)) = stack.pop() {
+fn append_dir_all(dst: &mut Write, path: &Path, src_path: &Path, mode: HeaderMode, follow: bool) -> io::Result<()> {
+    let mut stack = vec![(src_path.to_path_buf(), true, false)];
+    while let Some((src, is_dir, is_symlink)) = stack.pop() {
         let dest = path.join(src.strip_prefix(&src_path).unwrap());
         if is_dir {
             for entry in try!(fs::read_dir(&src)) {
                 let entry = try!(entry);
-                stack.push((entry.path(), try!(entry.file_type()).is_dir()));
+                let file_type = try!(entry.file_type());
+                stack.push((entry.path(), file_type.is_dir(), file_type.is_symlink()));
             }
             if dest != Path::new("") {
                 try!(append_dir(dst, &dest, &src, mode));
             }
+        } else if !follow && is_symlink {
+            let stat = try!(fs::symlink_metadata(&src));
+            let link_name = try!(fs::read_link(&src));
+            try!(append_fs(dst, &dest, &stat, &mut io::empty(), mode, Some(&link_name)));
         } else {
             try!(append_file(dst, &dest, &mut try!(fs::File::open(src)), mode));
         }
