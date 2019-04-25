@@ -492,7 +492,7 @@ impl<'a> EntryFields<'a> {
                 ::std::os::windows::fs::symlink_file(src, dst)
             }
 
-            #[cfg(any(unix, target_os = "redox"))]
+            #[cfg(unix)]
             fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
                 ::std::os::unix::fs::symlink(src, dst)
             }
@@ -586,7 +586,7 @@ impl<'a> EntryFields<'a> {
         }
         return Ok(());
 
-        #[cfg(any(unix, target_os = "redox"))]
+        #[cfg(unix)]
         fn set_perms(dst: &Path, mode: u32, preserve: bool) -> io::Result<()> {
             use std::os::unix::prelude::*;
 
@@ -652,7 +652,6 @@ impl<'a> EntryFields<'a> {
         // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
         #[cfg(any(
             windows,
-            target_os = "redox",
             not(feature = "xattr"),
             target_arch = "wasm32"
         ))]
